@@ -1,0 +1,66 @@
+name: PXF Smart Merge
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge-pxf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Ensure merge tool present
+        run: |
+          test -f tools/pxf_merge.py || { echo "tools/pxf_merge.py missing"; exit 1; }
+
+      - name: Locate common ancestor (BASE)
+        id: base
+        run: |
+          BASE_SHA=$(git merge-base HEAD origin/${{ github.event.pull_request.base.ref }})
+          echo "BASE_SHA=$BASE_SHA" >> $GITHUB_OUTPUT
+
+      - name: Extract BASE/OURS/THEIRS .pxf
+        run: |
+          # Remplacez path/to/font.pxf par le vrai chemin
+          git show ${{ steps.base.outputs.BASE_SHA }}:path/to/font.pxf > /tmp/base.pxf || true
+          cp path/to/font.pxf /tmp/ours.pxf || true
+          git fetch origin ${{ github.event.pull_request.base.ref }} --depth=1
+          git show origin/${{ github.event.pull_request.base.ref }}:path/to/font.pxf > /tmp/theirs.pxf || true
+
+      - name: Apply semantic merge
+        run: |
+          python tools/pxf_merge.py /tmp/base.pxf /tmp/ours.pxf /tmp/theirs.pxf path/to/font.pxf merge-choices.json || exit 1
+
+      - name: Commit result if changed
+        run: |
+          if ! git diff --quiet -- path/to/font.pxf; then
+            git config user.name "pxf-merge-bot"
+            git config user.email "bot@users.noreply.github.com"
+            git add path/to/font.pxf
+            git commit -m "chore(merge): auto-merge .pxf par glyphe"
+            git push
+          fi
+
+      - name: PR summary
+        uses: thollander/actions-comment-pull-request@v2
+        with:
+          message: |
+            ✅ Merge .pxf effectué automatiquement **par glyphe**.
+            - Conflit sur le même glyphe ? Règle par défaut : **theirs (last-writer-wins)**.
+            - Pour forcer: ajoutez/éditez `merge-choices.json` dans cette PR, ex:
+              ```json
+              { "33": "ours", "34": "theirs" }
+              ```
+          comment_tag: pxf-merge-report
