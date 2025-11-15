@@ -72,49 +72,55 @@ jobs:
         id: apply_merge
         if: ${{ steps.changed.outputs.files != '' }}
         run: |
-          set -e
-          mkdir -p /tmp/ours
-          MERGED_LIST=""
-          while IFS= read -r f; do
+            set -e
+            mkdir -p /tmp/ours /tmp/reports
+            MERGED_LIST=""
+            while IFS= read -r f; do
             [ -z "$f" ] && continue
-            mkdir -p "/tmp/ours/$(dirname "$f")"
+            mkdir -p "/tmp/ours/$(dirname "$f")" "/tmp/base/$(dirname "$f")" "/tmp/theirs/$(dirname "$f")"
             cp "$f" "/tmp/ours/$f" 2>/dev/null || true
-            python tools/pxf_merge.py "/tmp/base/$f" "/tmp/ours/$f" "/tmp/theirs/$f" "$f" merge-choices.json
+            # Write per-file reports so we can concatenate later
+            python tools/pxf_merge.py "/tmp/base/$f" "/tmp/ours/$f" "/tmp/theirs/$f" "$f" merge-choices.json "/tmp/reports/${f//\//_}.json" "/tmp/reports/${f//\//_}.md"
             MERGED_LIST="${MERGED_LIST}\n- ${f}"
-          done << 'EOF'
-          ${{ steps.changed.outputs.files }}
-          EOF
-          echo "merged_list<<EOF" >> $GITHUB_OUTPUT
-          echo -e "$MERGED_LIST" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+            done << 'EOF'
+            ${{ steps.changed.outputs.files }}
+            EOF
+            echo "merged_list<<EOF" >> $GITHUB_OUTPUT
+            echo -e "$MERGED_LIST" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Commit result if any .pxf changed
         if: ${{ steps.changed.outputs.files != '' }}
         run: |
-          if ! git diff --quiet -- ${{ steps.changed.outputs.files }}; then
+            if ! git diff --quiet -- ${{ steps.changed.outputs.files }}; then
             git config user.name "pxf-merge-bot"
             git config user.email "bot@users.noreply.github.com"
             git add ${{ steps.changed.outputs.files }}
             git commit -m "chore(pxf-merge): semantic per-glyph auto-merge for updated .pxf files"
             git push
-          fi
+            fi
 
-      - name: PR summary (English)
+      - name: Assemble PR summary (English)
+        if: ${{ steps.changed.outputs.files != '' }}
+        run: |
+            echo "### ✅ PXF semantic merge completed (per glyph)" > /tmp/summary.md
+            echo "" >> /tmp/summary.md
+            echo "Files processed:" >> /tmp/summary.md
+            echo "${{ steps.apply_merge.outputs.merged_list }}" >> /tmp/summary.md
+            echo "" >> /tmp/summary.md
+            # Append all per-file Markdown reports
+            if ls /tmp/reports/*.md >/dev/null 2>&1; then
+            for f in /tmp/reports/*.md; do
+                echo "" >> /tmp/summary.md
+                echo "---" >> /tmp/summary.md
+                echo "" >> /tmp/summary.md
+                cat "$f" >> /tmp/summary.md
+            done
+            fi
+
+      - name: PR comment
         if: ${{ steps.changed.outputs.files != '' }}
         uses: thollander/actions-comment-pull-request@v2
         with:
-          message: |
-            ✅ **PXF semantic merge completed (per glyph)**
-            Files processed:
-            ${{ steps.apply_merge.outputs.merged_list }}
-
-            **Rules**
-            - If both sides edited the same glyph: default = **theirs (last-writer-wins)**.
-            - To override per glyph, add/edit `merge-choices.json` in this PR, e.g.:
-              ```json
-              { "33": "ours", "34": "theirs" }
-              ```
-            - `num_glyphs` is recomputed after merge.
-
-            _Note:_ Only `.pxf` files changed in this PR are handled automatically.
-          comment_tag: pxf-merge-report
+            filePath: /tmp/summary.md
+            comment_tag: pxf-merge-report
