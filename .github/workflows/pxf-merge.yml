@@ -1,8 +1,8 @@
-name: PXF Smart Merge
+name: PXF Smart Merge (multi-font)
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, synchronize, reopened, edited, ready_for_review]
 
 permissions:
   contents: write
@@ -10,9 +10,12 @@ permissions:
 
 jobs:
   merge-pxf:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout base repo
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -25,42 +28,93 @@ jobs:
         run: |
           test -f tools/pxf_merge.py || { echo "tools/pxf_merge.py missing"; exit 1; }
 
-      - name: Locate common ancestor (BASE)
+      - name: Compute common ancestor (BASE)
         id: base
         run: |
           BASE_SHA=$(git merge-base HEAD origin/${{ github.event.pull_request.base.ref }})
           echo "BASE_SHA=$BASE_SHA" >> $GITHUB_OUTPUT
 
-      - name: Extract BASE/OURS/THEIRS .pxf
+      - name: List changed .pxf files in PR (added/modified/renamed)
+        id: changed
         run: |
-          # Remplacez path/to/font.pxf par le vrai chemin
-          git show ${{ steps.base.outputs.BASE_SHA }}:path/to/font.pxf > /tmp/base.pxf || true
-          cp path/to/font.pxf /tmp/ours.pxf || true
-          git fetch origin ${{ github.event.pull_request.base.ref }} --depth=1
-          git show origin/${{ github.event.pull_request.base.ref }}:path/to/font.pxf > /tmp/theirs.pxf || true
+          set -e
+          FILES=$(git diff --name-only --diff-filter=ACMRT ${{ steps.base.outputs.BASE_SHA }}...HEAD | grep -E '\.pxf$' || true)
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "Changed PXF files:"
+          echo "$FILES"
 
-      - name: Apply semantic merge
-        run: |
-          python tools/pxf_merge.py /tmp/base.pxf /tmp/ours.pxf /tmp/theirs.pxf path/to/font.pxf merge-choices.json || exit 1
-
-      - name: Commit result if changed
-        run: |
-          if ! git diff --quiet -- path/to/font.pxf; then
-            git config user.name "pxf-merge-bot"
-            git config user.email "bot@users.noreply.github.com"
-            git add path/to/font.pxf
-            git commit -m "chore(merge): auto-merge .pxf par glyphe"
-            git push
-          fi
-
-      - name: PR summary
+      - name: Stop early if nothing to do
+        if: ${{ steps.changed.outputs.files == '' }}
         uses: thollander/actions-comment-pull-request@v2
         with:
           message: |
-            ✅ Merge .pxf effectué automatiquement **par glyphe**.
-            - Conflit sur le même glyphe ? Règle par défaut : **theirs (last-writer-wins)**.
-            - Pour forcer: ajoutez/éditez `merge-choices.json` dans cette PR, ex:
+            ℹ️ No `.pxf` changes detected in this PR. Nothing to merge.
+          comment_tag: pxf-merge-report
+
+      - name: Prepare base/theirs snapshots
+        if: ${{ steps.changed.outputs.files != '' }}
+        run: |
+          set -e
+          mkdir -p /tmp/base /tmp/theirs
+          git fetch origin ${{ github.event.pull_request.base.ref }} --depth=1
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            mkdir -p "/tmp/base/$(dirname "$f")" "/tmp/theirs/$(dirname "$f")"
+            git show ${{ steps.base.outputs.BASE_SHA }}:"$f" > "/tmp/base/$f" 2>/dev/null || true
+            git show origin/${{ github.event.pull_request.base.ref }}:"$f" > "/tmp/theirs/$f" 2>/dev/null || true
+          done << 'EOF'
+          ${{ steps.changed.outputs.files }}
+          EOF
+
+      - name: Apply semantic merge per .pxf
+        id: apply_merge
+        if: ${{ steps.changed.outputs.files != '' }}
+        run: |
+          set -e
+          mkdir -p /tmp/ours
+          MERGED_LIST=""
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            mkdir -p "/tmp/ours/$(dirname "$f")"
+            cp "$f" "/tmp/ours/$f" 2>/dev/null || true
+            python tools/pxf_merge.py "/tmp/base/$f" "/tmp/ours/$f" "/tmp/theirs/$f" "$f" merge-choices.json
+            MERGED_LIST="${MERGED_LIST}\n- ${f}"
+          done << 'EOF'
+          ${{ steps.changed.outputs.files }}
+          EOF
+          echo "merged_list<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$MERGED_LIST" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Commit result if any .pxf changed
+        if: ${{ steps.changed.outputs.files != '' }}
+        run: |
+          if ! git diff --quiet -- ${{ steps.changed.outputs.files }}; then
+            git config user.name "pxf-merge-bot"
+            git config user.email "bot@users.noreply.github.com"
+            git add ${{ steps.changed.outputs.files }}
+            git commit -m "chore(pxf-merge): semantic per-glyph auto-merge for updated .pxf files"
+            git push
+          fi
+
+      - name: PR summary (English)
+        if: ${{ steps.changed.outputs.files != '' }}
+        uses: thollander/actions-comment-pull-request@v2
+        with:
+          message: |
+            ✅ **PXF semantic merge completed (per glyph)**
+            Files processed:
+            ${{ steps.apply_merge.outputs.merged_list }}
+
+            **Rules**
+            - If both sides edited the same glyph: default = **theirs (last-writer-wins)**.
+            - To override per glyph, add/edit `merge-choices.json` in this PR, e.g.:
               ```json
               { "33": "ours", "34": "theirs" }
               ```
+            - `num_glyphs` is recomputed after merge.
+
+            _Note:_ Only `.pxf` files changed in this PR are handled automatically.
           comment_tag: pxf-merge-report
